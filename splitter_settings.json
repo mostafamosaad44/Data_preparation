@@ -1,0 +1,7 @@
+{
+  "input_path": "",
+  "output_dir": "",
+  "tile_size": 512,
+  "extension": ".png",
+  "name_pattern": "{base}_tile_{y}_{x}"
+}
