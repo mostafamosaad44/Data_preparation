@@ -4,7 +4,7 @@
   "output_dir": "",
   "tile_size": 512,
   "overlap_pct": 0.0,
-  "extension": ".png",
+  "extension": ".jpeg",
   "t1_base": "",
   "t2_base": "",
   "name_pattern": "{base}_tile_{y}_{x}",
