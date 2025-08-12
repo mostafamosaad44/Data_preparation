@@ -1,4 +1,14 @@
-Data Preparation — v2.4
+# app/help_text.py
+# -*- coding: utf-8 -*-
+
+"""
+Help content for the Data Preparation app.
+Feel free to edit this file — the GUI reads the text as-is.
+You can use the variables {APP_TITLE} and {APP_VERSION}; they will be substituted.
+"""
+
+HELP_TEXT_EN = r"""
+{APP_TITLE} — {APP_VERSION}
 
 Quick overview
 --------------
@@ -86,6 +96,16 @@ A: Base is the filename prefix for tiles. Example: Base(T1)=2012_test ⇒
 
 Q: Which merge method should I use?  
 A: The manifest-based merge is more accurate because it uses exact coordinates.
+
+
 Note: Merge using Manifest give results better than merge from Folder
 
 Good luck ♥
+"""
+
+def get_help_text(app_title: str, app_version: str, lang: str = "en") -> str:
+    """Return help text with {APP_TITLE}/{APP_VERSION} substituted.
+    We keep other double-braced tokens like {{base}} intact.
+    """
+    text = HELP_TEXT_EN
+    return text.replace("{APP_TITLE}", app_title).replace("{APP_VERSION}", app_version)

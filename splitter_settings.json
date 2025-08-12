@@ -1,17 +1,19 @@
 {
   "input_path": "",
+  "input_path_t2": "",
   "output_dir": "",
   "tile_size": 512,
   "overlap_pct": 0.0,
   "extension": ".png",
+  "t1_base": "",
+  "t2_base": "",
   "name_pattern": "{base}_tile_{y}_{x}",
   "scene_id": "",
   "fold": "train",
-  "dual_time": false,
-  "input_path_t2": "",
   "label_path": "",
-  "write_parquet": true,
-  "tiles_dir": "",
-  "merge_out_path": "",
-  "merge_fold": ""
+  "write_parquet": false,
+  "tiles_dir": "F:/PHD/dataset/delet/T1",
+  "merge_out_path": "F:/PHD/dataset/delet/T1/merge/2.tif",
+  "merge_fold": "",
+  "theme": "Dark"
 }

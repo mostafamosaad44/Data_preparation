@@ -1,22 +1,36 @@
 # app/gui.py
+# -*- coding: utf-8 -*-
+
 import os
 import json
 import csv
+import math
 import threading
+import warnings
 import tkinter as tk
 from tkinter import filedialog, messagebox, ttk, scrolledtext
 
 import numpy as np
 from PIL import Image, ImageTk
 
-from app.splitter import _load_image_any
-from app.merger import (
-    _scan_tiles,
-    _estimate_canvas_size,
-)
+# Safety: allow very large images; silence DecompressionBomb & tifffile user warnings
+Image.MAX_IMAGE_PIXELS = None
+warnings.simplefilter("ignore", Image.DecompressionBombWarning)
+warnings.filterwarnings("ignore", category=UserWarning, module="tifffile")
+
+# split/merge helpers
+from app.splitter import split_large_image
+from app.merger import _scan_tiles, _estimate_canvas_size
+
+# help loader (fallback to static string if module missing)
+try:
+    from app.help_text import get_help_text
+except Exception:
+    def get_help_text(app_title: str, app_version: str, lang: str = "en") -> str:
+        return f"{app_title} — {app_version}\n\nHelp file not found (app/help_text.py)."
 
 APP_TITLE = "Data Preparation"
-APP_VERSION = "v2.2"
+APP_VERSION = "v2.4"
 AUTHOR = "Built by Mosatafa Mosaad"
 
 SETTINGS_FILE = "splitter_settings.json"
@@ -30,6 +44,8 @@ INPUT_FILTER = [
 
 # ------------------------- Tooltip helper -------------------------
 class Tooltip:
+    """Small tooltip popover for any Tk widget."""
+
     def __init__(self, widget, text, delay=600, wraplength=360):
         self.widget = widget
         self.text = text
@@ -79,6 +95,8 @@ class Tooltip:
 
 # ------------------------- Progress dialog (with Cancel) -------------------------
 class ProgressDialog:
+    """Modal progress dialog with Cancel button and thread-safe updates."""
+
     def __init__(self, master: tk.Tk, title="Working...", determinate=True):
         self.master = master
         self.top = tk.Toplevel(master)
@@ -112,13 +130,13 @@ class ProgressDialog:
         if not determinate:
             self.bar.start(8)
 
-        # center
+        # center on parent
         self.top.update_idletasks()
         w = self.top.winfo_width()
         h = self.top.winfo_height()
         x = master.winfo_rootx() + (master.winfo_width() - w) // 2
         y = master.winfo_rooty() + (master.winfo_height() - h) // 2
-        self.top.geometry(f"+{max(0,x)}+{max(0,y)}")
+        self.top.geometry(f"+{max(0, x)}+{max(0, y)}")
 
     def _on_cancel(self):
         self.cancelled = True
@@ -159,51 +177,79 @@ class ProgressDialog:
         self.master.after(0, _apply)
 
 
+# ------------------------- Quick probe (H,W,C) -------------------------
+def _probe_image_info_fast(path: str):
+    """Return (H, W, C) by reading metadata only (no full pixel load)."""
+    try:
+        with Image.open(path) as im:
+            w, h = im.size
+            try:
+                c = len(im.getbands()) if im.getbands() else 1
+            except Exception:
+                c = 1
+            return int(h), int(w), int(c)
+    except Exception as e:
+        raise ValueError(f"Could not read image metadata: {e}")
+
+
+def _save_kwargs_for_ext(ext: str) -> dict:
+    ext = (ext or "").lower()
+    if not ext.startswith("."):
+        ext = "." + ext
+    if ext in (".jpg", ".jpeg"):
+        return {"quality": 95, "optimize": True}
+    if ext in (".tif", ".tiff"):
+        return {"compression": "tiff_lzw"}
+    return {}
+
+
 # ------------------------- Main App -------------------------
 class ImagePrepApp(ttk.Frame):
     def __init__(self, master):
         super().__init__(master)
         self.master: tk.Tk = master
         self.master.title(f"{APP_TITLE} — {APP_VERSION}")
-        self.master.geometry("1100x780")
+        self.master.geometry("1120x800")
         self.master.minsize(1040, 720)
 
         self._init_style()
 
         # ---- State ----
         self.input_path = tk.StringVar()
+        self.input_path_t2 = tk.StringVar()
         self.output_dir = tk.StringVar()
-        self.tile_size = tk.IntVar(value=512)
-        self.overlap_pct = tk.DoubleVar(value=0.0)  # [0, <100)
-        self.extension = tk.StringVar(value=".png")
-        self.name_pattern = tk.StringVar(value="{base}_tile_{y}_{x}")
-        self.selected_bands_vars = []   # populated per-image
 
-        # Rich manifest
+        self.tile_size = tk.IntVar(value=512)
+        self.overlap_pct = tk.DoubleVar(value=0.0)
+        self.extension = tk.StringVar(value=".png")
+
+        # Optional base names for T1/T2
+        self.t1_base = tk.StringVar(value="")
+        self.t2_base = tk.StringVar(value="")
+
+        self.name_pattern = tk.StringVar(value="{base}_tile_{y}_{x}")
+        self.selected_bands_vars = []
+
+        # Training metadata
         self.scene_id = tk.StringVar(value="")
         self.fold = tk.StringVar(value="train")
-        self.dual_time = tk.BooleanVar(value=False)  # OFF => T1-only
-        self.input_path_t2 = tk.StringVar()
         self.label_path = tk.StringVar()
         self.write_parquet = tk.BooleanVar(value=False)
 
         # Merge
         self.tiles_dir = tk.StringVar()
         self.merge_out_path = tk.StringVar()
-        self.merge_fold_var = tk.StringVar(value="")  # "", "train", "val", "test"
+        self.merge_fold_var = tk.StringVar(value="")
 
         # Theme
-        self.theme_var = tk.StringVar(value="System")  # Light / Dark / System
+        self.theme_var = tk.StringVar(value="System")
 
         # Layout
         self._build_root_layout()
         self._create_pages()
         self._load_settings()
 
-        # default page
         self._show_page("split")
-
-        # save on close
         self.master.protocol("WM_DELETE_WINDOW", self._on_close)
 
     # ---------------- UI Style ----------------
@@ -217,77 +263,53 @@ class ImagePrepApp(ttk.Frame):
 
     def _apply_theme_colors(self, mode: str):
         if mode == "Dark":
-            bg = "#1f232a"
-            fg = "#e6e6e6"
-            subbg = "#272c34"
-            acc = "#3a82f7"
+            bg = "#1f232a"; fg = "#e6e6e6"; subbg = "#272c34"; acc = "#3a82f7"
         elif mode == "Light":
-            bg = "#ffffff"
-            fg = "#111"
-            subbg = "#f3f4f6"
-            acc = "#0b5ed7"
-        else:  # System
-            bg = "#f8f9fb"
-            fg = "#111"
-            subbg = "#ffffff"
-            acc = "#0b5ed7"
+            bg = "#ffffff"; fg = "#111"; subbg = "#f3f4f6"; acc = "#0b5ed7"
+        else:
+            bg = "#f8f9fb"; fg = "#111"; subbg = "#ffffff"; acc = "#0b5ed7"
 
         self.master.configure(bg=bg)
         for elem in ("TFrame", "TLabelframe", "TLabelframe.Label", "TLabel", "TNotebook", "TScrollbar"):
             self.style.configure(elem, background=subbg if "Label" in elem else bg, foreground=fg)
         self.style.configure("TButton", background=subbg, foreground=fg)
         self.style.map("TButton", background=[("active", acc)])
-
         self.style.configure("Status.TLabel", foreground="#666" if mode != "Dark" else "#aab")
-        self.style.configure("Accent.TButton", padding=6)
-        try:
-            self.style.configure("Horizontal.TProgressbar", troughcolor=subbg, background=acc)
-        except Exception:
-            pass
 
     # ---------------- Root Layout ----------------
     def _build_root_layout(self):
         header = ttk.Frame(self.master)
         header.pack(side="top", fill="x", padx=10, pady=(10, 6))
 
-        left = ttk.Frame(header)
-        left.pack(side="left")
+        left = ttk.Frame(header); left.pack(side="left")
         ttk.Label(left, text=APP_TITLE, font=("Segoe UI Semibold", 14)).pack(side="left")
         ttk.Label(left, text=f"{APP_VERSION} — {AUTHOR}", style="Status.TLabel").pack(side="left", padx=(10, 0))
 
-        right = ttk.Frame(header)
-        right.pack(side="right")
+        right = ttk.Frame(header); right.pack(side="right")
         ttk.Label(right, text="Theme:").pack(side="left", padx=(0, 6))
         theme_combo = ttk.Combobox(right, textvariable=self.theme_var,
                                    values=["System", "Light", "Dark"], state="readonly", width=10)
         theme_combo.pack(side="left")
         theme_combo.bind("<<ComboboxSelected>>", lambda e: self._apply_theme_colors(self.theme_var.get()))
-        Tooltip(theme_combo, "Switch basic theme colors.\n(System, Light, or Dark).")
+        Tooltip(theme_combo, "Switch theme (System / Light / Dark).")
 
-        # Body
-        body = ttk.Frame(self.master)
-        body.pack(side="top", fill="both", expand=True, padx=10, pady=6)
+        body = ttk.Frame(self.master); body.pack(side="top", fill="both", expand=True, padx=10, pady=6)
 
-        # Side menu
+        # Sidebar
         self.sidebar = ttk.Frame(body, width=200)
         self.sidebar.pack(side="left", fill="y")
         self.sidebar.pack_propagate(False)
-
-        self.btn_split = ttk.Button(self.sidebar, text="Splitter", command=lambda: self._show_page("split"))
-        self.btn_merge = ttk.Button(self.sidebar, text="Merge Tool", command=lambda: self._show_page("merge"))
-        self.btn_preview = ttk.Button(self.sidebar, text="Preview", command=lambda: self._show_page("preview"))
-        self.btn_help = ttk.Button(self.sidebar, text="Help", command=lambda: self._show_page("help"))
-        for b in (self.btn_split, self.btn_merge, self.btn_preview, self.btn_help):
-            b.pack(fill="x", pady=6)
+        ttk.Button(self.sidebar, text="Splitter", command=lambda: self._show_page("split")).pack(fill="x", pady=6)
+        ttk.Button(self.sidebar, text="Merge Tool", command=lambda: self._show_page("merge")).pack(fill="x", pady=6)
+        ttk.Button(self.sidebar, text="Preview", command=lambda: self._show_page("preview")).pack(fill="x", pady=6)
+        ttk.Button(self.sidebar, text="Help", command=lambda: self._show_page("help")).pack(fill="x", pady=6)
 
         # Content
-        self.content = ttk.Frame(body)
-        self.content.pack(side="left", fill="both", expand=True)
+        self.content = ttk.Frame(body); self.content.pack(side="left", fill="both", expand=True)
         self.pages = {}
 
         # Status bar
-        status_row = ttk.Frame(self.master)
-        status_row.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
+        status_row = ttk.Frame(self.master); status_row.pack(side="bottom", fill="x", padx=10, pady=(0, 8))
         self.status = ttk.Label(status_row, text="Ready", style="Status.TLabel", anchor="w")
         self.status.pack(side="left", fill="x", expand=True)
 
@@ -308,57 +330,73 @@ class ImagePrepApp(ttk.Frame):
     def _build_split_page(self, parent):
         page = ttk.Frame(parent)
 
-        # Group: I/O
+        # I/O (T1, then T2 underneath)
         io_frame = ttk.LabelFrame(page, text="Input / Output")
         io_frame.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(io_frame, text="Input Image (T1):").grid(row=0, column=0, sticky="w", padx=6, pady=6)
-        in_entry = ttk.Entry(io_frame, textvariable=self.input_path, width=80)
-        in_entry.grid(row=0, column=1, sticky="we", padx=6, pady=6)
-        in_btn = ttk.Button(io_frame, text="Browse...", command=self._pick_input)
-        in_btn.grid(row=0, column=2, padx=6, pady=6)
-        Tooltip(in_btn, "Choose the main (T1) image to split.")
+        t1_entry = ttk.Entry(io_frame, textvariable=self.input_path, width=80)
+        t1_entry.grid(row=0, column=1, sticky="we", padx=6, pady=6)
+        b1 = ttk.Button(io_frame, text="Browse...", command=self._pick_input)
+        b1.grid(row=0, column=2, padx=6, pady=6)
+        Tooltip(b1, "Choose the main (T1) image to split.")
 
-        ttk.Label(io_frame, text="Output Folder:").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(io_frame, text="Input Image (T2):").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        t2_entry = ttk.Entry(io_frame, textvariable=self.input_path_t2, width=80)
+        t2_entry.grid(row=1, column=1, sticky="we", padx=6, pady=6)
+        b2 = ttk.Button(io_frame, text="Browse...", command=lambda: self._pick_input_generic(self.input_path_t2))
+        b2.grid(row=1, column=2, padx=6, pady=6)
+        Tooltip(b2, "Optional second-time image (T2). Must match T1 size.")
+
+        ttk.Label(io_frame, text="Output Folder:").grid(row=2, column=0, sticky="w", padx=6, pady=6)
         out_entry = ttk.Entry(io_frame, textvariable=self.output_dir, width=80)
-        out_entry.grid(row=1, column=1, sticky="we", padx=6, pady=6)
-        out_btn = ttk.Button(io_frame, text="Browse...", command=self._pick_output)
-        out_btn.grid(row=1, column=2, padx=6, pady=6)
-        Tooltip(out_btn, "Choose where tiles and manifest will be saved.")
+        out_entry.grid(row=2, column=1, sticky="we", padx=6, pady=6)
+        b3 = ttk.Button(io_frame, text="Browse...", command=self._pick_output)
+        b3.grid(row=2, column=2, padx=6, pady=6)
+        Tooltip(b3, "Where T1/ and T2/ folders will be created.")
         io_frame.columnconfigure(1, weight=1)
 
-        # Group: Tiling
+        # Tiling
         tiling = ttk.LabelFrame(page, text="Tiling")
         tiling.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(tiling, text="Tile Size (px):").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         tile_entry = ttk.Entry(tiling, textvariable=self.tile_size, width=10)
         tile_entry.grid(row=0, column=1, sticky="w", padx=6, pady=6)
-        Tooltip(tile_entry, "Tile width and height in pixels (e.g., 256 / 512 / 1024).")
+        Tooltip(tile_entry, "Tile width/height in pixels (e.g., 256 / 512 / 1024).")
 
         ttk.Label(tiling, text="Overlap (%):").grid(row=0, column=2, sticky="w", padx=6, pady=6)
         ov_entry = ttk.Entry(tiling, textvariable=self.overlap_pct, width=10)
         ov_entry.grid(row=0, column=3, sticky="w", padx=6, pady=6)
-        Tooltip(ov_entry, "Percentage of tile size to overlap between adjacent tiles.\n"
-                          "Set 0 for no overlap. Typical values: 10–50%.")
+        Tooltip(ov_entry, "Percentage of tile size to overlap between tiles. Set 0 for no overlap.")
 
         ttk.Label(tiling, text="Output Format:").grid(row=0, column=4, sticky="w", padx=6, pady=6)
         fmt_combo = ttk.Combobox(tiling, textvariable=self.extension, values=EXT_OPTIONS, state="readonly", width=10)
         fmt_combo.grid(row=0, column=5, sticky="w", padx=6, pady=6)
         Tooltip(fmt_combo, "File format for tiles (.png / .jpg / .tif / .tiff / .jpeg).")
 
-        ttk.Label(tiling, text="Filename Pattern:").grid(row=1, column=0, sticky="w", padx=6, pady=6)
+        # Base names for T1/T2
+        ttk.Label(tiling, text="Base (T1):").grid(row=1, column=0, sticky="e", padx=6, pady=6)
+        t1base_entry = ttk.Entry(tiling, textvariable=self.t1_base, width=28)
+        t1base_entry.grid(row=1, column=1, sticky="w", padx=6, pady=6)
+        Tooltip(t1base_entry, "If empty, the T1 filename (without extension) will be used.")
+
+        ttk.Label(tiling, text="Base (T2):").grid(row=1, column=2, sticky="e", padx=6, pady=6)
+        t2base_entry = ttk.Entry(tiling, textvariable=self.t2_base, width=28)
+        t2base_entry.grid(row=1, column=3, sticky="w", padx=6, pady=6)
+        Tooltip(t2base_entry, "If empty, Base(T1) + '_T2' will be used.")
+
+        ttk.Label(tiling, text="Filename Pattern:").grid(row=2, column=0, sticky="w", padx=6, pady=6)
         pat_entry = ttk.Entry(tiling, textvariable=self.name_pattern, width=60)
-        pat_entry.grid(row=1, column=1, columnspan=5, sticky="we", padx=6, pady=6)
-        tip = ("Tokens:\n"
-               "• {base}: original filename without extension\n"
-               "• {y}/{x} (or {row}/{col}): top-left offsets\n"
-               "• {i}: running index (supports {i:06d})\n"
-               "• {ext}: extension without dot\n"
-               "Examples: {base}_tile_{y}_{x}   |   {base}_{y:05d}_{x:05d}\n"
-               "NOTE: folder-based Merge needs {y} and {x} in filenames.")
-        Tooltip(pat_entry, tip)
+        pat_entry.grid(row=2, column=1, columnspan=5, sticky="we", padx=6, pady=6)
+        Tooltip(
+            pat_entry,
+            "Tokens: {base} {y} {x} {row} {col} {i} {ext}\n"
+            "Example: {base}_tile_{y}_{x}\n"
+            "Tip: merge-from-folder expects {y} and {x} in the name."
+        )
         tiling.columnconfigure(1, weight=1)
+        tiling.columnconfigure(3, weight=1)
 
         # Bands
         bands = ttk.LabelFrame(page, text="Bands (Channels)")
@@ -366,41 +404,29 @@ class ImagePrepApp(ttk.Frame):
         self.band_box = ttk.Frame(bands)
         self.band_box.pack(fill="x", padx=8, pady=8)
 
-        # Metadata
+        # Training metadata
         meta = ttk.LabelFrame(page, text="Training Metadata")
         meta.pack(fill="x", padx=10, pady=10)
 
         ttk.Label(meta, text="Scene ID:").grid(row=0, column=0, sticky="w", padx=6, pady=6)
         scene_entry = ttk.Entry(meta, textvariable=self.scene_id, width=28)
         scene_entry.grid(row=0, column=1, sticky="w", padx=6, pady=6)
-        Tooltip(scene_entry, "Unique identifier for the scene (defaults to base filename if empty).")
+        Tooltip(scene_entry, "Unique identifier for the scene. Defaults to T1 base name if empty.")
 
         ttk.Label(meta, text="Fold:").grid(row=0, column=2, sticky="w", padx=6, pady=6)
-        fold_combo = ttk.Combobox(meta, textvariable=self.fold, values=["train", "val", "test"], state="readonly", width=12)
+        fold_combo = ttk.Combobox(meta, textvariable=self.fold, values=["train", "val", "test"],
+                                  state="readonly", width=12)
         fold_combo.grid(row=0, column=3, sticky="w", padx=6, pady=6)
-        Tooltip(fold_combo, "Predefined split for ML datasets. Keeps scenes independent across folds.")
+        Tooltip(fold_combo, "Predefined split for ML datasets.")
 
-        dual_chk = ttk.Checkbutton(meta, text="Dual-time (T1/T2)", variable=self.dual_time)
-        dual_chk.grid(row=1, column=0, sticky="w", padx=6, pady=6)
-        Tooltip(dual_chk, "Uncheck for T1-only.\nCheck to split a second image (T2) on the exact same grid.")
-
-        ttk.Label(meta, text="T2 Image:").grid(row=2, column=0, sticky="w", padx=6, pady=6)
-        t2_entry = ttk.Entry(meta, textvariable=self.input_path_t2, width=60)
-        t2_entry.grid(row=2, column=1, columnspan=2, sticky="we", padx=6, pady=6)
-        t2_btn = ttk.Button(meta, text="Browse...", command=lambda: self._pick_input_generic(self.input_path_t2))
-        t2_btn.grid(row=2, column=3, padx=6, pady=6)
-        Tooltip(t2_btn, "Pick the second-time image (T2).\nDimensions must match T1; otherwise T2 is skipped.")
-
-        ttk.Label(meta, text="Label (optional):").grid(row=3, column=0, sticky="w", padx=6, pady=6)
+        ttk.Label(meta, text="Label (optional):").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         lbl_entry = ttk.Entry(meta, textvariable=self.label_path, width=60)
-        lbl_entry.grid(row=3, column=1, columnspan=2, sticky="we", padx=6, pady=6)
-        lbl_btn = ttk.Button(meta, text="Browse...", command=lambda: self._pick_input_generic(self.label_path))
-        lbl_btn.grid(row=3, column=3, padx=6, pady=6)
-        Tooltip(lbl_btn, "Optional per-scene label or annotations path. Stored as-is in manifest.")
+        lbl_entry.grid(row=1, column=1, columnspan=2, sticky="we", padx=6, pady=6)
+        Tooltip(lbl_entry, "Optional label/annotation path to store in manifest.")
 
         pq_chk = ttk.Checkbutton(meta, text="Write Parquet alongside CSV", variable=self.write_parquet)
-        pq_chk.grid(row=4, column=0, sticky="w", padx=6, pady=6)
-        Tooltip(pq_chk, "If pandas/pyarrow are installed, a manifest.parquet will be saved next to manifest.csv.")
+        pq_chk.grid(row=1, column=3, sticky="w", padx=6, pady=6)
+        Tooltip(pq_chk, "If pandas/pyarrow are installed, also write manifest.parquet.")
 
         meta.columnconfigure(1, weight=1)
         meta.columnconfigure(2, weight=1)
@@ -408,15 +434,17 @@ class ImagePrepApp(ttk.Frame):
         # Actions
         actions = ttk.Frame(page)
         actions.pack(fill="x", padx=10, pady=(0, 10))
-
         prev_btn = ttk.Button(actions, text="Preview First Tile", command=self._preview_from_split)
         prev_btn.pack(side="left", padx=(0, 8))
-        Tooltip(prev_btn, "Shows the first tile (0:tile, 0:tile) using current band selection.")
+        Tooltip(prev_btn, "Open a preview window of the first tile (0..tile_size).")
 
         split_btn = ttk.Button(actions, text="Split Image", command=self._do_split_threaded)
-        split_btn.pack(side="left")
-        Tooltip(split_btn, "Start splitting with progress bar and write a rich manifest.\n"
-                           "If Dual-time is enabled, T2 tiles are saved into an 'T2/' subfolder.")
+        split_btn.pack(side="left", padx=(0, 8))
+        Tooltip(split_btn, "Start splitting with progress and per-folder manifests.")
+
+        reset_btn = ttk.Button(actions, text="Reset", command=self._reset_all)
+        reset_btn.pack(side="left")
+        Tooltip(reset_btn, "Reset all fields to defaults and clear saved settings.")
 
         return page
 
@@ -432,14 +460,14 @@ class ImagePrepApp(ttk.Frame):
         tiles_entry.grid(row=0, column=1, sticky="we", padx=6, pady=6)
         tiles_btn = ttk.Button(src, text="Browse...", command=self._pick_tiles_dir)
         tiles_btn.grid(row=0, column=2, padx=6, pady=6)
-        Tooltip(tiles_btn, "Select a folder of tiles whose names end with _<y>_<x>.<ext>.")
+        Tooltip(tiles_btn, "Select a folder of tiles. Names should end with _<y>_<x>.<ext>.")
 
         ttk.Label(src, text="Output File:").grid(row=1, column=0, sticky="w", padx=6, pady=6)
         out_entry = ttk.Entry(src, textvariable=self.merge_out_path, width=80)
         out_entry.grid(row=1, column=1, sticky="we", padx=6, pady=6)
         out_btn = ttk.Button(src, text="Save As...", command=self._pick_merge_out)
         out_btn.grid(row=1, column=2, padx=6, pady=6)
-        Tooltip(out_btn, "Where to save the merged image (use .tif for very large sizes).")
+        Tooltip(out_btn, "Save merged image (use .tif for very large sizes).")
         src.columnconfigure(1, weight=1)
 
         ops = ttk.LabelFrame(page, text="Operations")
@@ -447,18 +475,18 @@ class ImagePrepApp(ttk.Frame):
 
         est_btn = ttk.Button(ops, text="Scan & Estimate Size", command=self._estimate_merge)
         est_btn.grid(row=0, column=0, padx=6, pady=6)
-        Tooltip(est_btn, "Scan the folder and estimate merged canvas size and mode.")
+        Tooltip(est_btn, "Scan folder and estimate merged size and mode.")
 
         self.merge_estimate_lbl = ttk.Label(ops, text="")
         self.merge_estimate_lbl.grid(row=0, column=1, padx=6, pady=6, sticky="w")
 
         merge_btn = ttk.Button(ops, text="Merge from Folder", command=self._do_merge_threaded)
         merge_btn.grid(row=1, column=0, padx=6, pady=6)
-        Tooltip(merge_btn, "Merge tiles from folder (requires names ending in _<y>_<x>.<ext>).")
+        Tooltip(merge_btn, "Merge based on tile filenames (expects _<y>_<x> in name).")
 
         m_manifest_btn = ttk.Button(ops, text="Merge from manifest.csv", command=self._merge_from_manifest_threaded)
         m_manifest_btn.grid(row=1, column=1, padx=6, pady=6)
-        Tooltip(m_manifest_btn, "Merge by reading positions from manifest.csv (x0, y0, w, h, t1_path).")
+        Tooltip(m_manifest_btn, "Merge by reading positions from manifest.csv (recommended).")
 
         ttk.Label(ops, text="(optional) Fold filter:").grid(row=1, column=2, sticky="e", padx=6, pady=6)
         fold_combo = ttk.Combobox(ops, textvariable=self.merge_fold_var, values=["", "train", "val", "test"],
@@ -471,141 +499,124 @@ class ImagePrepApp(ttk.Frame):
     # ---------------- Preview Page ----------------
     def _build_preview_page(self, parent):
         page = ttk.Frame(parent)
-
-        info = ttk.Label(page, text="Quick Preview (uses Splitter settings)",
-                         font=("Segoe UI Semibold", 11))
+        info = ttk.Label(page, text="Quick Preview (uses Splitter settings)", font=("Segoe UI Semibold", 11))
         info.pack(anchor="w", padx=10, pady=(10, 6))
 
         btn = ttk.Button(page, text="Preview First Tile", command=self._preview_from_split)
         btn.pack(anchor="w", padx=10, pady=6)
-        Tooltip(btn, "Open a preview window with the first tile after band selection and normalization.")
+        Tooltip(btn, "Open a preview for the first tile after band selection and normalization.")
 
         self.preview_info = ttk.Label(page, text="", style="Status.TLabel")
         self.preview_info.pack(anchor="w", padx=10, pady=(6, 10))
-
         return page
 
     # ---------------- Help Page ----------------
     def _build_help_page(self, parent):
         page = ttk.Frame(parent)
 
-        ttk.Label(page, text=f"{APP_TITLE} — {APP_VERSION}", font=("Segoe UI Semibold", 14)).pack(
-            anchor="w", padx=10, pady=(10, 4)
-        )
+        ttk.Label(page, text=f"{APP_TITLE} — {APP_VERSION}", font=("Segoe UI Semibold", 14))\
+            .pack(anchor="w", padx=10, pady=(10, 4))
         ttk.Label(page, text=AUTHOR, style="Status.TLabel").pack(anchor="w", padx=10, pady=(0, 8))
 
+        # Controls
+        btns = ttk.Frame(page); btns.pack(fill="x", padx=10, pady=(0, 6))
+        ttk.Button(btns, text="Reload Help", command=lambda: self._reload_help_text(self._help_textbox))\
+            .pack(side="left", padx=(0, 6))
+        ttk.Button(btns, text="Open help file", command=self._open_help_source)\
+            .pack(side="left")
+
+        # Text box
         box = scrolledtext.ScrolledText(page, wrap="word", width=120, height=30, font=("Segoe UI", 10))
         box.pack(fill="both", expand=True, padx=10, pady=10)
 
-        help_text = """
-OVERVIEW
-This tool prepares large imagery for ML:
-• Split huge images into tiles with optional overlap (%, not px).
-• Optionally split a second-time image (T2) on the same grid.
-• Write a rich manifest for training.
-• Merge tiles back, either from folder naming or from manifest.csv.
-
-SPLITTER
-1) Input Image (T1) + Output Folder.
-2) Tile Size (px). Recommended: 256 / 512 / 1024.
-3) Overlap (%): 0.. <100. Typical: 10–50.
-4) Output Format: .png / .jpg / .tif / .tiff / .jpeg.
-5) Filename Pattern tokens:
-   {base}  {y}  {x}  {row}  {col}  {i}  {ext}
-   Examples:
-     {base}_tile_{y}_{x}
-     {base}_{y:05d}_{x:05d}
-   NOTE: folder-based Merge needs {y} and {x} in filenames.
-6) Bands: select channels to export (defaults to all).
-7) Training Metadata:
-   • Scene ID (defaults to base filename if blank)
-   • Fold: train / val / test
-   • Dual-time (T1/T2): tiles for T2 saved under "T2/" if dimensions match
-   • Label (optional)
-   • Parquet: saves manifest.parquet if pandas/pyarrow available.
-
-MANIFEST COLUMNS
-scene_id, tile_x, tile_y, x0, y0, w, h, t1_path, t2_path, label_path, fold
-• tile_x, tile_y: grid indices (step = tile_size - overlap_px).
-• x0, y0: top-left pixel offsets; w, h: on-disk tile size.
-
-MERGE
-• From Folder: requires filenames ending with _<y>_<x>.<ext>. Last tile wins in overlap.
-• From manifest.csv: uses x0, y0, w, h, t1_path (or t2_path).
-  Optional Fold filter to merge only train/val/test rows.
-
-TIPS
-• Install 'imagecodecs' for faster TIFF/PNG I/O.
-• Use .tif for extremely large merged outputs.
-• Keep naming stable for reproducible experiments.
-"""
-        box.insert("1.0", help_text.strip())
+        try:
+            help_text = get_help_text(APP_TITLE, APP_VERSION, lang="en")
+        except Exception as e:
+            help_text = f"Failed to load help text:\n{e}"
+        box.insert("1.0", help_text)
         box.configure(state="disabled")
 
+        # keep a reference for reloading
+        self._help_textbox = box
         return page
 
     # ---------------- Pickers ----------------
     def _pick_input(self):
-        path = filedialog.askopenfilename(filetypes=INPUT_FILTER)
-        if path:
+        try:
+            path = filedialog.askopenfilename(filetypes=INPUT_FILTER)
+            if not path:
+                return
+            try:
+                H, W, C = _probe_image_info_fast(path)
+            except Exception as e:
+                messagebox.showerror("Error", f"Could not read image metadata:\n{e}")
+                return
             self.input_path.set(path)
-            self._populate_bands(path)
+            self._populate_bands_from_count(C)
             self._save_settings()
-            self.status.config(text=f"Selected T1: {path}")
+            self.status.config(text=f"Selected T1: {path} (H={H}, W={W}, C={C})")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed selecting input:\n{e}")
 
     def _pick_input_generic(self, var: tk.StringVar):
-        path = filedialog.askopenfilename(filetypes=INPUT_FILTER)
-        if path:
-            var.set(path)
-            self._save_settings()
+        try:
+            path = filedialog.askopenfilename(filetypes=INPUT_FILTER)
+            if path:
+                var.set(path)
+                self._save_settings()
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed selecting file:\n{e}")
 
     def _pick_output(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.output_dir.set(folder)
-            self._save_settings()
-            self.status.config(text=f"Output folder: {folder}")
+        try:
+            folder = filedialog.askdirectory()
+            if folder:
+                self.output_dir.set(folder)
+                self._save_settings()
+                self.status.config(text=f"Output folder: {folder}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed selecting output folder:\n{e}")
 
     def _pick_tiles_dir(self):
-        folder = filedialog.askdirectory()
-        if folder:
-            self.tiles_dir.set(folder)
-            self.status.config(text=f"Tiles folder: {folder}")
+        try:
+            folder = filedialog.askdirectory()
+            if folder:
+                self.tiles_dir.set(folder)
+                self.status.config(text=f"Tiles folder: {folder}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed selecting tiles folder:\n{e}")
 
     def _pick_merge_out(self):
-        path = filedialog.asksaveasfilename(
-            defaultextension=".tif",
-            filetypes=[("TIFF", "*.tif;*.tiff"), ("PNG", "*.png"),
-                       ("JPEG", "*.jpg;*.jpeg"), ("All files", "*.*")]
-        )
-        if path:
-            self.merge_out_path.set(path)
-            self.status.config(text=f"Merged output: {path}")
+        try:
+            path = filedialog.asksaveasfilename(
+                defaultextension=".tif",
+                filetypes=[("TIFF", "*.tif;*.tiff"), ("PNG", "*.png"),
+                           ("JPEG", "*.jpg;*.jpeg"), ("All files", "*.*")]
+            )
+            if path:
+                self.merge_out_path.set(path)
+                self.status.config(text=f"Merged output: {path}")
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed choosing output file:\n{e}")
 
     # ---------------- Bands ----------------
-    def _populate_bands(self, file_path: str):
+    def _populate_bands_from_count(self, bands_count: int):
+        """Populate band checkboxes based on channel count (without loading full image)."""
         for w in self.band_box.winfo_children():
             w.destroy()
         self.selected_bands_vars.clear()
-
         try:
-            arr = _load_image_any(file_path)
-        except Exception as e:
-            messagebox.showerror("Error", f"Could not read image:\n{e}")
-            return
-
-        if arr.ndim == 2:
-            var = tk.IntVar(value=1)
-            cb = ttk.Checkbutton(self.band_box, text="Band 0", variable=var)
-            cb.pack(anchor="w", padx=6, pady=2)
-            self.selected_bands_vars.append(var)
-        else:
-            bands = arr.shape[2]
-            for b in range(bands):
+            if bands_count <= 1:
                 var = tk.IntVar(value=1)
-                cb = ttk.Checkbutton(self.band_box, text=f"Band {b}", variable=var)
-                cb.pack(anchor="w", padx=6, pady=2)
+                ttk.Checkbutton(self.band_box, text="Band 0", variable=var).pack(anchor="w", padx=6, pady=2)
                 self.selected_bands_vars.append(var)
+            else:
+                for b in range(bands_count):
+                    var = tk.IntVar(value=1)
+                    ttk.Checkbutton(self.band_box, text=f"Band {b}", variable=var).pack(anchor="w", padx=6, pady=2)
+                    self.selected_bands_vars.append(var)
+        except Exception as e:
+            messagebox.showerror("Error", f"Failed populating bands:\n{e}")
 
     def _selected_bands(self):
         picked = [i for i, v in enumerate(self.selected_bands_vars) if v.get() == 1]
@@ -616,7 +627,6 @@ TIPS
         if not self.input_path.get():
             messagebox.showinfo("Preview", "Please select an input image first.")
             return
-
         try:
             tile = int(self.tile_size.get())
             if tile <= 0:
@@ -626,88 +636,101 @@ TIPS
             return
 
         try:
-            arr = _load_image_any(self.input_path.get())
-            sel = self._selected_bands()
-            if arr.ndim == 3 and sel is not None:
-                arr = arr[:, :, sel]
+            with Image.open(self.input_path.get()) as im:
+                crop = im.crop((0, 0, min(im.width, tile), min(im.height, tile)))
+                try:
+                    parts = crop.split()
+                    sel = self._selected_bands()
+                    if sel is not None and len(parts) >= max(sel) + 1:
+                        parts_sel = tuple(parts[i] for i in sel)
+                        if len(parts_sel) == 1:
+                            crop = parts_sel[0]
+                        elif len(parts_sel) == 3:
+                            crop = Image.merge("RGB", parts_sel[:3])
+                        elif len(parts_sel) == 4:
+                            crop = Image.merge("RGBA", parts_sel[:4])
+                except Exception:
+                    arr = np.array(crop)
+                    sel = self._selected_bands()
+                    if sel is not None and arr.ndim == 3 and arr.shape[2] >= max(sel) + 1:
+                        arr = arr[:, :, sel]
+                    # min-max normalization
+                    if arr.dtype != np.uint8:
+                        a = arr.astype(np.float32)
+                        if a.ndim == 2:
+                            mn, mx = float(a.min()), float(a.max())
+                            a = (a - mn) / (mx - mn) * 255.0 if mx > mn else np.zeros_like(a)
+                        else:
+                            for c in range(a.shape[2]):
+                                mn, mx = float(a[..., c].min()), float(a[..., c].max())
+                                a[..., c] = (a[..., c] - mn) / (mx - mn) * 255.0 if mx > mn else 0
+                        arr = a.astype(np.uint8)
+                    crop = Image.fromarray(arr)
 
-            arr = self._to_uint8_minmax(arr)
-            y2 = min(tile, arr.shape[0])
-            x2 = min(tile, arr.shape[1])
-            tile_arr = arr[0:y2, 0:x2] if arr.ndim == 2 else arr[0:y2, 0:x2, :]
-            self._show_preview(tile_arr)
+                max_side = 512
+                scale = min(max_side / max(crop.size), 1.0)
+                if scale < 1.0:
+                    crop = crop.resize((int(crop.width * scale), int(crop.height * scale)), Image.BILINEAR)
+
+                top = tk.Toplevel(self.master)
+                top.title("Preview")
+                top.resizable(False, False)
+                photo = ImageTk.PhotoImage(crop)
+                lbl = ttk.Label(top, image=photo)
+                lbl.image = photo
+                lbl.pack(padx=8, pady=8)
+
             self.preview_info.config(text="Preview opened (first tile).")
             self.status.config(text="Preview shown.")
         except Exception as e:
-            messagebox.showerror("Preview error", str(e))
+            messagebox.showerror("Preview error", f"Could not preview:\n{e}")
             self.status.config(text="Preview failed.")
 
-    def _show_preview(self, tile_arr: np.ndarray):
-        img = Image.fromarray(tile_arr)
-        max_side = 512
-        w, h = img.size
-        scale = min(max_side / max(w, h), 1.0)
-        if scale < 1.0:
-            img = img.resize((int(w * scale), int(h * scale)), Image.BILINEAR)
-
-        top = tk.Toplevel(self.master)
-        top.title("Preview")
-        top.resizable(False, False)
-        photo = ImageTk.PhotoImage(img)
-        lbl = ttk.Label(top, image=photo)
-        lbl.image = photo
-        lbl.pack(padx=8, pady=8)
-
-    @staticmethod
-    def _to_uint8_minmax(arr: np.ndarray) -> np.ndarray:
-        if arr.dtype == np.uint8:
-            return arr
-        if arr.ndim == 2:
-            a = arr.astype(np.float32)
-            mn, mx = float(a.min()), float(a.max())
-            a = (a - mn) / (mx - mn) * 255.0 if mx > mn else np.zeros_like(a)
-            return a.astype(np.uint8)
-        h, w, c = arr.shape
-        out = np.empty((h, w, c), dtype=np.uint8)
-        for i in range(c):
-            a = arr[..., i].astype(np.float32)
-            mn, mx = float(a.min()), float(a.max())
-            a = (a - mn) / (mx - mn) * 255.0 if mx > mn else np.zeros_like(a)
-            out[..., i] = a.astype(np.uint8)
-        return out
-
-    # ---------- filename pattern helper ----------
-    @staticmethod
-    def _format_name_from_pattern(pattern: str, base: str, y: int, x: int, i: int, ext: str) -> str:
-        name = pattern
+    # ---------------- Reset ----------------
+    def _reset_all(self):
+        """Reset all fields to defaults and clear saved settings file."""
+        self.input_path.set("")
+        self.input_path_t2.set("")
+        self.output_dir.set("")
+        self.tile_size.set(512)
+        self.overlap_pct.set(0.0)
+        self.extension.set(".png")
+        self.t1_base.set("")
+        self.t2_base.set("")
+        self.name_pattern.set("{base}_tile_{y}_{x}")
+        self.scene_id.set("")
+        self.fold.set("train")
+        self.label_path.set("")
+        self.write_parquet.set(False)
+        for w in self.band_box.winfo_children():
+            w.destroy()
+        self.selected_bands_vars.clear()
+        self.status.config(text="Reset to defaults.")
         try:
-            name = name.format(i=i)
+            if os.path.exists(SETTINGS_FILE):
+                os.remove(SETTINGS_FILE)
         except Exception:
             pass
-        name = name.format(base=base, y=y, x=x, row=y, col=x, ext=ext.lstrip("."))
-        if not name.lower().endswith(ext if ext.startswith(".") else "." + ext):
-            name = f"{name}{ext if ext.startswith('.') else '.' + ext}"
-        return name
 
-    # ---------------- Split (threaded with determinate progress & cancel) ----------------
+    # ---------------- Split (threaded) ----------------
     def _do_split_threaded(self):
         t = threading.Thread(target=self._do_split_worker, daemon=True)
         t.start()
 
     def _do_split_worker(self):
         # Validation
-        if not self.input_path.get() or not os.path.isfile(self.input_path.get()):
+        in_path = (self.input_path.get() or "").strip()
+        out_dir = (self.output_dir.get() or "").strip()
+        if not in_path or not os.path.isfile(in_path):
             return self._msg_error("Please select a valid input image (T1).")
-        if not self.output_dir.get():
+        if not out_dir:
             return self._msg_error("Please select an output folder.")
-
         try:
             tile = int(self.tile_size.get())
             if tile <= 0:
                 raise ValueError
         except Exception:
             return self._msg_error("Tile size must be a positive integer.")
-
         try:
             pct = float(self.overlap_pct.get())
         except Exception:
@@ -715,123 +738,62 @@ TIPS
         if pct < 0 or pct >= 100:
             return self._msg_error("Overlap (%) must be in [0, <100).")
 
-        overlap_px = int(round(tile * pct / 100.0))
-        if overlap_px >= tile and pct > 0:
-            return self._msg_error("Overlap too large for this tile size.")
-
-        # Load arrays
-        in_path = self.input_path.get()
-        out_dir = self.output_dir.get()
-        os.makedirs(out_dir, exist_ok=True)
-
-        selected_bands = self._selected_bands()
-
+        # Estimate total tiles for progress bar
         try:
-            arr = _load_image_any(in_path)
-            if arr.ndim == 3 and selected_bands is not None:
-                arr = arr[:, :, selected_bands]
-            arr = self._to_uint8_minmax(arr)
-        except Exception as e:
-            return self._msg_error(f"Could not read T1:\n{e}")
+            H, W, _ = _probe_image_info_fast(in_path)
+            overlap_px = int(round(tile * pct / 100.0))
+            step = tile if overlap_px <= 0 else max(1, tile - overlap_px)
+            total = math.ceil(H / step) * math.ceil(W / step)
+        except Exception:
+            total = 0
 
-        H, W = arr.shape[:2]
-        is_color = (arr.ndim == 3)
-        base = os.path.splitext(os.path.basename(in_path))[0]
-        ext = self.extension.get() if self.extension.get().startswith(".") else "." + self.extension.get()
-
-        # Optional T2
-        dual = bool(self.dual_time.get())
-        t2_enabled = dual and os.path.isfile(self.input_path_t2.get().strip())
-        arr2 = None
-        t2_dir = None
-        if t2_enabled:
-            try:
-                arr2 = _load_image_any(self.input_path_t2.get().strip())
-                if arr2.ndim == 3 and selected_bands is not None:
-                    arr2 = arr2[:, :, selected_bands]
-                arr2 = self._to_uint8_minmax(arr2)
-                if arr2.shape[:2] != (H, W):
-                    self._msg_warn("T2 dimensions do not match T1. Skipping T2.")
-                    t2_enabled = False
-                    arr2 = None
-                else:
-                    t2_dir = os.path.join(out_dir, "T2")
-                    os.makedirs(t2_dir, exist_ok=True)
-            except Exception as e:
-                self._msg_warn(f"Could not read T2. Skipping T2.\n{e}")
-                t2_enabled = False
-                arr2 = None
-
-        # Build coords
-        step = tile if overlap_px == 0 else max(1, tile - overlap_px)
-        coords = []
-        for y in range(0, H, step):
-            for x in range(0, W, step):
-                if y >= H or x >= W:
-                    continue
-                y2, x2 = min(y + tile, H), min(x + tile, W)
-                coords.append((y, x, y2, x2))
-        total = len(coords)
-
-        # Progress dialog
         pd = ProgressDialog(self.master, title="Splitting tiles...", determinate=True)
         pd.set_message("Splitting tiles...")
-        pd.set_total(total)
+        if total > 0:
+            pd.set_total(total)
+        else:
+            pd.set_indeterminate()
 
-        # Manifest rows
-        rows = []
-        label_src = self.label_path.get().strip()
-        scene_id = self.scene_id.get().strip() or base
-        fold = (self.fold.get() or "train").lower()
-
-        # Do work
-        tiles = 0
         try:
-            for i, (y, x, y2, x2) in enumerate(coords):
-                if pd.cancelled:
-                    break
-
-                tile_arr = arr[y:y2, x:x2] if not is_color else arr[y:y2, x:x2, :]
-                fname = self._format_name_from_pattern(self.name_pattern.get(), base, y, x, i, ext)
-                t1_path = os.path.join(out_dir, fname)
-                Image.fromarray(tile_arr).save(t1_path)
-
-                t2_path = ""
-                if t2_enabled and arr2 is not None:
-                    tile2 = arr2[y:y2, x:x2] if not is_color else arr2[y:y2, x:x2, :]
-                    t2_path = os.path.join(t2_dir, fname)
-                    Image.fromarray(tile2).save(t2_path)
-
-                tile_x = x // step
-                tile_y = y // step
-                w = int(x2 - x)
-                h = int(y2 - y)
-                rows.append([scene_id, tile_x, tile_y, x, y, w, h, t1_path, t2_path, label_src, fold])
-
-                tiles += 1
-                if i % 8 == 0:
-                    pd.set_message(f"Splitting tiles... ({i+1}/{total})")
-                pd.step(1)
-
-            # Write manifest (even if cancelled, نكتب للي اتعمل)
-            if rows:
-                man_path = os.path.join(out_dir, "manifest.csv")
-                with open(man_path, "w", newline="", encoding="utf-8") as f:
-                    wcsv = csv.writer(f)
-                    wcsv.writerow(["scene_id","tile_x","tile_y","x0","y0","w","h","t1_path","t2_path","label_path","fold"])
-                    wcsv.writerows(rows)
-            else:
-                man_path = "(none)"
-
+            result = split_large_image(
+                input_path=in_path,
+                output_dir=out_dir,
+                tile_size=tile,
+                extension=self.extension.get(),
+                selected_bands=self._selected_bands(),
+                normalize_mode="minmax",
+                policy="auto",
+                name_pattern=self.name_pattern.get(),
+                overlap_pct=pct,
+                t2_path=(self.input_path_t2.get() or "").strip() or None,
+                # custom base names & T2 pattern:
+                t1_base=(self.t1_base.get() or "").strip() or None,
+                t2_base=(self.t2_base.get() or "").strip() or None,
+                name_pattern_t2=None,  # reuse same pattern with different base
+                # manifest per folder:
+                write_manifest=True,
+                scene_id=(self.scene_id.get() or "").strip() or None,
+                label_path=(self.label_path.get() or "").strip(),
+                fold=(self.fold.get() or "train"),
+                write_parquet=bool(self.write_parquet.get()),
+                # progress callback: return True to cancel
+                progress=lambda i, tot: (pd.step(1), pd.set_message(f"Splitting tiles... ({i+1}/{tot})") or pd.cancelled)[-1],
+            )
             pd.close()
-            if pd.cancelled:
-                self._msg_warn(f"Operation cancelled.\nTiles written: {tiles}\nManifest: {man_path}")
-                self.status.config(text="Split cancelled.")
-            else:
-                self._msg_info("Success",
-                               f"✅ Splitting complete!\nTiles: {tiles}\nManifest: {man_path}"
-                               + (f"\nT2 tiles saved under: {t2_dir}" if t2_enabled else ""))
-                self.status.config(text="Split done.")
+
+            msg = [
+                "✅ Splitting complete!",
+                f"Tiles total (T1+T2): {result.get('tiles', 0)}",
+                f"T1 dir: {result.get('t1_dir','')}",
+                f"T1 manifest: {result.get('t1_manifest','(none)')}",
+            ]
+            if result.get("t2_used"):
+                msg.append(f"T2 dir: {result.get('t2_dir','')}")
+                msg.append(f"T2 manifest: {result.get('t2_manifest','(none)')}")
+            if result.get("note"):
+                msg.append(f"Note: {result['note']}")
+            self._msg_info("Success", "\n".join(msg))
+            self.status.config(text="Split done.")
         except Exception as e:
             pd.close()
             self._msg_error(f"Splitting failed:\n{e}")
@@ -853,7 +815,7 @@ TIPS
             messagebox.showerror("Estimate error", str(e))
             self.status.config(text="Merge estimate failed.")
 
-    # ---------------- Merge (threaded with determinate progress & cancel) ----------------
+    # ---------------- Merge (threaded) ----------------
     def _do_merge_threaded(self):
         t = threading.Thread(target=self._do_merge_worker, daemon=True)
         t.start()
@@ -873,7 +835,6 @@ TIPS
         if not self.merge_out_path.get():
             return self._msg_error("Please choose an output file.")
 
-        # prepare file list
         try:
             files = _scan_tiles(self.tiles_dir.get())
             if not files:
@@ -890,9 +851,7 @@ TIPS
         pd.set_message("Merging tiles (folder)...")
         pd.set_total(len(files))
 
-        pasted = 0
         try:
-            # filenames must end with _<y>_<x>.<ext>
             import re
             _TILE_RE = re.compile(r".*_(\d+)_(\d+)\.[A-Za-z0-9]+$")
             for i, fp in enumerate(files):
@@ -903,13 +862,11 @@ TIPS
                         im = im.convert(target_mode)
                     m = _TILE_RE.match(os.path.basename(fp))
                     if not m:
-                        # skip non-matching
                         pd.step(1)
                         continue
                     y = int(m.group(1))
                     x = int(m.group(2))
                     canvas.paste(im, (x, y))
-                pasted += 1
                 if i % 16 == 0:
                     pd.set_message(f"Merging tiles... ({i+1}/{len(files)})")
                 pd.step(1)
@@ -950,26 +907,37 @@ TIPS
                 return
             self.merge_out_path.set(out)
 
-        # read manifest rows (+ optional fold filter)
+        # Read manifest rows (+ optional fold filter)
         try:
             with open(manifest_path, "r", encoding="utf-8") as f:
                 reader = csv.DictReader(f)
                 header = [c.strip() for c in (reader.fieldnames or [])]
-                for req in ["x0", "y0", "w", "h", "t1_path"]:
+
+                # Path column can be t1_path, t2_path, or generic path
+                img_col = None
+                for cand in ("t1_path", "t2_path", "path"):
+                    if cand in header:
+                        img_col = cand
+                        break
+                if img_col is None:
+                    return self._msg_error("Manifest must contain a path column (t1_path / t2_path / path).")
+
+                for req in ["x0", "y0", "w", "h"]:
                     if req not in header:
                         return self._msg_error(f"Manifest missing column: {req}")
+
                 rows = [r for r in reader]
         except Exception as e:
             return self._msg_error(f"Could not read manifest:\n{e}")
 
-        fold_filter = self.merge_fold_var.get().strip()
+        fold_filter = (self.merge_fold_var.get() or "").strip()
         if fold_filter:
             rows = [r for r in rows if (r.get("fold", "").lower() == fold_filter.lower())]
 
         if not rows:
             return self._msg_error("No rows to merge (after filtering).")
 
-        # canvas size + target mode
+        # Canvas size + target mode
         try:
             max_x2 = 0
             max_y2 = 0
@@ -979,10 +947,10 @@ TIPS
                 w = int(float(r["w"]));   h = int(float(r["h"]))
                 max_x2 = max(max_x2, x0 + w)
                 max_y2 = max(max_y2, y0 + h)
-                if not first_img and (r.get("t1_path") or "").strip():
-                    first_img = r["t1_path"].strip()
+                if not first_img and (r.get(img_col) or "").strip():
+                    first_img = r[img_col].strip()
             if not first_img:
-                return self._msg_error("No valid t1_path in manifest.")
+                return self._msg_error("No valid path in manifest.")
             target_mode = self._infer_mode_from_image(first_img)
         except Exception as e:
             return self._msg_error(f"Manifest parse error:\n{e}")
@@ -994,13 +962,12 @@ TIPS
         pd.set_message("Merging tiles (manifest)...")
         pd.set_total(len(rows))
 
-        pasted = 0
         try:
             for i, r in enumerate(rows):
                 if pd.cancelled:
                     break
 
-                img_path = (r.get("t1_path") or "").strip()
+                img_path = (r.get(img_col) or "").strip()
                 if not img_path or not os.path.isfile(img_path):
                     pd.step(1)
                     continue
@@ -1019,7 +986,6 @@ TIPS
                         im = im.resize((w, h), Image.BILINEAR)
                     canvas.paste(im, (x0, y0))
 
-                pasted += 1
                 if i % 32 == 0:
                     pd.set_message(f"Merging tiles... ({i+1}/{len(rows)})")
                 pd.step(1)
@@ -1038,7 +1004,40 @@ TIPS
             self._msg_error(f"Merge (manifest) failed:\n{e}")
             self.status.config(text="Merge from manifest failed.")
 
-    # ---------------- Messages (thread-safe helpers) ----------------
+    # ---------------- Help helpers ----------------
+    def _reload_help_text(self, box_widget=None):
+        """Reload help text from app/help_text.py without restarting the app."""
+        try:
+            import importlib
+            from app import help_text as _help_mod
+            importlib.reload(_help_mod)
+            text = _help_mod.get_help_text(APP_TITLE, APP_VERSION, lang="en")
+        except Exception as e:
+            text = f"Failed to reload help text:\n{e}"
+
+        box = box_widget or getattr(self, "_help_textbox", None)
+        if box is not None:
+            box.configure(state="normal")
+            box.delete("1.0", "end")
+            box.insert("1.0", text)
+            box.configure(state="disabled")
+            self.status.config(text="Help reloaded.")
+
+    def _open_help_source(self):
+        """Open the help source file in the default OS editor."""
+        try:
+            import pathlib, sys, subprocess, os as _os
+            help_path = pathlib.Path(__file__).parent / "help_text.py"
+            if sys.platform.startswith("win"):
+                _os.startfile(help_path)  # type: ignore[attr-defined]
+            elif sys.platform == "darwin":
+                subprocess.Popen(["open", str(help_path)])
+            else:
+                subprocess.Popen(["xdg-open", str(help_path)])
+        except Exception as e:
+            messagebox.showinfo("Help file", f"Help file path:\n{help_path}\n\nError opening:\n{e}")
+
+    # ---------------- Messages & Settings ----------------
     def _msg_info(self, title, text):
         self.master.after(0, lambda: messagebox.showinfo(title, text))
 
@@ -1048,28 +1047,24 @@ TIPS
     def _msg_warn(self, text):
         self.master.after(0, lambda: messagebox.showwarning("Warning", text))
 
-    # ---------------- Settings ----------------
     def _save_settings(self):
         data = {
-            # splitter
             "input_path": self.input_path.get(),
+            "input_path_t2": self.input_path_t2.get(),
             "output_dir": self.output_dir.get(),
             "tile_size": self.tile_size.get(),
             "overlap_pct": float(self.overlap_pct.get()),
             "extension": self.extension.get(),
+            "t1_base": self.t1_base.get(),
+            "t2_base": self.t2_base.get(),
             "name_pattern": self.name_pattern.get(),
-            # manifest-rich
             "scene_id": self.scene_id.get(),
             "fold": self.fold.get(),
-            "dual_time": bool(self.dual_time.get()),
-            "input_path_t2": self.input_path_t2.get(),
             "label_path": self.label_path.get(),
             "write_parquet": bool(self.write_parquet.get()),
-            # merge
             "tiles_dir": self.tiles_dir.get(),
             "merge_out_path": self.merge_out_path.get(),
             "merge_fold": self.merge_fold_var.get(),
-            # theme
             "theme": self.theme_var.get(),
         }
         try:
@@ -1085,15 +1080,16 @@ TIPS
             with open(SETTINGS_FILE, "r", encoding="utf-8") as f:
                 data = json.load(f)
             self.input_path.set(data.get("input_path") or "")
+            self.input_path_t2.set(data.get("input_path_t2") or "")
             self.output_dir.set(data.get("output_dir") or "")
             self.tile_size.set(int(data.get("tile_size", 512)))
             self.overlap_pct.set(float(data.get("overlap_pct", 0.0)))
             self.extension.set(data.get("extension") or ".png")
+            self.t1_base.set(data.get("t1_base", ""))
+            self.t2_base.set(data.get("t2_base", ""))
             self.name_pattern.set(data.get("name_pattern") or "{base}_tile_{y}_{x}")
             self.scene_id.set(data.get("scene_id", ""))
             self.fold.set(data.get("fold", "train"))
-            self.dual_time.set(bool(data.get("dual_time", False)))
-            self.input_path_t2.set(data.get("input_path_t2", ""))
             self.label_path.set(data.get("label_path", ""))
             self.write_parquet.set(bool(data.get("write_parquet", False)))
             self.tiles_dir.set(data.get("tiles_dir", ""))
@@ -1103,11 +1099,19 @@ TIPS
             self._apply_theme_colors(self.theme_var.get())
 
             if self.input_path.get():
-                self._populate_bands(self.input_path.get())
+                try:
+                    _, _, C = _probe_image_info_fast(self.input_path.get())
+                    self._populate_bands_from_count(C)
+                except Exception:
+                    pass
         except Exception:
             pass
 
     def _on_close(self):
+        # To delete settings on exit instead, uncomment the next 3 lines.
+        # try:
+        #     if os.path.exists(SETTINGS_FILE): os.remove(SETTINGS_FILE)
+        # except Exception: pass
         self._save_settings()
         self.master.destroy()
 
