@@ -2,6 +2,16 @@
   "input_path": "",
   "output_dir": "",
   "tile_size": 512,
+  "overlap_pct": 0.0,
   "extension": ".png",
-  "name_pattern": "{base}_tile_{y}_{x}"
+  "name_pattern": "{base}_tile_{y}_{x}",
+  "scene_id": "",
+  "fold": "train",
+  "dual_time": false,
+  "input_path_t2": "",
+  "label_path": "",
+  "write_parquet": true,
+  "tiles_dir": "",
+  "merge_out_path": "",
+  "merge_fold": ""
 }
